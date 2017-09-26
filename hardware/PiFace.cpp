@@ -37,7 +37,8 @@
 #include <errno.h>
 #include <string.h>
 #include <string>
-#ifdef __arm__
+#ifdef HAVE_LINUX_SPI
+    #include <linux/ioctl.h>
     #include <linux/types.h>
     #include <linux/spi/spidev.h>
     #include <unistd.h>
@@ -55,6 +56,7 @@
 #include <cctype>
 #include <locale>
 #include "../main/localtime_r.h"
+#include "../main/WebServer.h"
 #include "../main/mainworker.h"
 
 #define PIFACE_INPUT_PROCESS_INTERVAL           5                // 100 msec
@@ -65,7 +67,7 @@
 
 extern std::string szUserDataFolder;
 
-const std::string CPiFace::ParameterNames[CONFIG_NR_OF_PARAMETER_TYPES]                       = {"enable","enabled","pin_type","count_enable","count_enabled","count_update_interval_sec","count_update_interval_s","count_update_interval","count_initial_value","count_minimum_pulse_period_msec","count_type","count_divider"};
+const std::string CPiFace::ParameterNames[CONFIG_NR_OF_PARAMETER_TYPES]                       = {"enable","enabled","pin_type","count_enable","count_enabled","count_update_interval_sec","count_update_interval_s","count_update_interval","count_update_interval_diff_perc","count_initial_value","count_minimum_pulse_period_msec","count_type","count_divider"};
 const std::string CPiFace::ParameterBooleanValueNames[CONFIG_NR_OF_PARAMETER_BOOL_TYPES]      = {"false","0","true","1"};
 const std::string CPiFace::ParameterPinTypeValueNames[CONFIG_NR_OF_PARAMETER_PIN_TYPES]       = {"level","inv_level","rising","falling"};
 const std::string CPiFace::ParameterCountTypeValueNames[CONFIG_NR_OF_PARAMETER_COUNT_TYPES]   = {"generic","rfxmeter","energy"};
@@ -376,21 +378,33 @@ int CPiFace::LoadConfig(void)
                             IOport->Pin[PinNumber].Count.SetUpdateInterval(UpdateInterval*1000);
                             result++;
                             break;
+
+                        case 8:
+                            //count_update_interval_diff_perc
+                            unsigned long UpdateIntervalPerc;
+                            
+                            UpdateIntervalPerc=strtol(Parametervalue.c_str(),NULL,0);
+                            if ( UpdateIntervalPerc < 1 || UpdateIntervalPerc > 1000 )
+                            {
+                                _log.Log(LOG_ERROR,"PiFace: Error config file: invalid value %s found", Parametervalue.c_str());
+                                break;
+                            }
+                            IOport->Pin[PinNumber].Count.SetUpdateIntervalPerc(UpdateIntervalPerc);
+                            result++;
                             
 #ifndef DISABLE_NEW_FUNCTIONS
                             /*  disabled until code part is completed and tested */
-                        case 8:
+                        case 9:
                             //count_initial_value
                             unsigned long StartValue;
                             
                             StartValue=strtol(Parametervalue.c_str(),NULL,0);
-                            IOport->Pin[PinNumber].Count.SetCurrent(StartValue);
                             IOport->Pin[PinNumber].Count.SetTotal(StartValue);
                             result++;
                             Regenerate_Config=true;
                             break;
 #endif
-                        case 9:
+                        case 10:
                             //count_minimum_pulse_period_msec
                             unsigned long Min_Pulse_Period;
                             
@@ -399,7 +413,7 @@ int CPiFace::LoadConfig(void)
                             result++;
                             break;
                         
-                        case 10:
+                        case 11:
                             //count_type
                             ValueFound=LocateValueInParameterArray(Parametervalue,ParameterCountTypeValueNames,CONFIG_NR_OF_PARAMETER_COUNT_TYPES);
                             switch (ValueFound )
@@ -421,7 +435,7 @@ int CPiFace::LoadConfig(void)
                             result++;
                             break;
                         
-                        case 11:
+                        case 12:
                             //count_divider
                             IOport->Pin[PinNumber].Count.SetDivider(strtol(Parametervalue.c_str(), NULL, 0));
                             result++;
@@ -454,24 +468,24 @@ void CPiFace::LoadDefaultConfig(void)
 {
     for (int i=0; i<=3 ;i++)
     {
-        for (int Pnr=0; Pnr<=7 ;Pnr++)
+        for (int PinNr=0; PinNr<=7 ;PinNr++)
         {
-            if (Pnr < 4)
+            if (PinNr < 4)
             {
-                m_Inputs[i].Pin[Pnr].Enabled=true;
+                m_Inputs[i].Pin[PinNr].Enabled=true;
             }
-            m_Inputs[i].Pin[Pnr].Type=TOGGLE_RISING;
-            m_Inputs[i].Pin[Pnr].Count.SetUpdateInterval(10000);
-            m_Inputs[i].Pin[Pnr].Direction = 'I';
+            m_Inputs[i].Pin[PinNr].Type=TOGGLE_RISING;
+            m_Inputs[i].Pin[PinNr].Count.SetUpdateInterval(10000);
+            m_Inputs[i].Pin[PinNr].Direction = 'I';
             
-            if (Pnr >= 4)
+            if (PinNr >= 4)
             {
-                m_Inputs[i].ConfigureCounter(Pnr,true);
+                m_Inputs[i].ConfigureCounter(PinNr,true);
             }
-            m_Outputs[i].ConfigureCounter(Pnr,true);
-            m_Outputs[i].Pin[Pnr].Type=LEVEL;
-            m_Outputs[i].Pin[Pnr].Count.SetUpdateInterval(10000);
-            m_Outputs[i].Pin[Pnr].Direction = 'O';
+            m_Outputs[i].ConfigureCounter(PinNr,true);
+            m_Outputs[i].Pin[PinNr].Type=LEVEL;
+            m_Outputs[i].Pin[PinNr].Count.SetUpdateInterval(10000);
+            m_Outputs[i].Pin[PinNr].Direction = 'O';
         }
     }
 }
@@ -488,53 +502,64 @@ void CPiFace::AutoCreate_piface_config(void)
 		"// Configuration line syntax:\r\n",
 		"// piface.<board address>.<I/O>.<pin number>.<parameter>=<value>\r\n",
 		"//\r\n",
-		"// <board address>:                Check piface (JP1 & JP2) jumper settings, value between 0..3\r\n",
+		"// <board address>:                 Check piface (JP1 & JP2) jumper settings, value between 0..3\r\n",
 		"//\r\n",
-		"// <I/O>:                          input\r\n",
-		"//                                 output\r\n",
+		"// <I/O>:                           input\r\n",
+		"//                                  output\r\n",
 		"//\r\n",
-		"// <pinnumber>:                    value between 0..7\r\n",
+		"// <pinnumber>:                     value between 0..7\r\n",
 		"//\r\n",
-		"// <parameter>:                    enabled\r\n",
-		"//                                 pin_type\r\n",
-		"//                                 count_enabled\r\n",
-		"//                                 count_update_interval_sec\r\n",
-		"//                                 count_initial_value\r\n",
-		"//                                 count_minimum_pulse_period\r\n",
+		"// <parameter>:                     enabled\r\n",
+		"//                                  pin_type\r\n",
+		"//                                  count_enabled\r\n",
+		"//                                  count_type\r\n",
+		"//                                  count_divider\r\n",
+        "//                                  count_update_interval_sec\r\n",
+        "//                                  count_update_interval_diff_perc\r\n",
+#ifndef DISABLE_NEW_FUNCTIONS
+        "//                                  count_initial_value\r\n",
+#endif
+        "//                                  count_minimum_pulse_period\r\n",
 		"//\r\n",
 		"// Available <parameter> / <values>:\r\n",
-		"// enabled:                        true  or 1\r\n",
-		"//                                 false or 0\r\n",
+		"// enabled:                         true  or 1\r\n",
+		"//                                  false or 0\r\n",
 		"//\r\n",
-		"// pin_type:                       level                     // best to keep this parameter to level for outputs, as Domoticz does not like other values\r\n",
-		"//                                 inv_level\r\n",
-		"//                                 rising\r\n",
-		"//                                 falling\r\n",
+		"// pin_type:                        level                     // best to keep this parameter to level for outputs, as Domoticz does not like other values\r\n",
+		"//                                  inv_level\r\n",
+		"//                                  rising\r\n",
+		"//                                  falling\r\n",
 		"//\r\n",
-		"// count_enabled:                  true  or 1\r\n",
-		"//                                 false or 0\r\n",
+		"// count_enabled:                   true  or 1\r\n",
+		"//                                  false or 0\r\n",
 		"//\r\n",
-		"// count_type:                     generic or rfxmeter       // default\r\n",
-		"//                                 energy\r\n",
+		"// count_type:                      generic or rfxmeter       // default\r\n",
+		"//                                  energy\r\n",
 		"//\r\n",
-		"// count_divider:                  1000                      // default\r\n",
-		"//                                 Pulses per unit.\r\n",
+		"// count_divider:                   1000                      // default\r\n",
+		"//                                  Pulses per unit.\r\n",
 		"//\r\n",
-		"// count_update_interval_sec:      0 to 3600\r\n",
+		"// count_update_interval_sec:       0 to 3600\r\n",
+        "// count_update_interval_diff_perc: 1 to 1000\r\n",
+        "//                                  This parameter can be used to force trigger an update when the difference in pulse intervals is above a certain percentage.\r\n",
+        "//                                  The value is a percentage of the previous interval. This can be useful for energy counters to quickly report large fluctuations\r\n",
+        "//                                  in active power.\r\n",
 		"//\r\n",
-		"// count_initial_value:            0 to 4294967295 counts\r\n",
+#ifndef DISABLE_NEW_FUNCTIONS
+        "// count_initial_value:             0 to 4294967295 counts\r\n",
 		"// Note1: The initial_value will only be used once. After it has been set, a new piface.conf will automatically be generated without the initial_value parameter(s)\r\n",
 		"// to ensure that it will only be used once.\r\n",
 		"// Using the initial_value to set a counter to a desired (start) value, will result in spikes in the Domoticz graphs.\r\n",
 		"// Note2: The initial_value is in counter counts, Domoticz scales (divides) this by the factor that is set in the GUI settings \r\n",
 		"//\r\n",
-		"// count_minimum_pulse_period_msec:     0 to 4294967295 milliseconds\r\n",
-		"//                                 This parameter sets a pulse rate limiter.\r\n",
-		"//                                 If multiple pulses are detected within the specified time period, they are ignored until the specified idle time has been met.\r\n",
-		"//                                 This can be useful for opto reflective sensors that count slow moving dials. Like water meters or gas meters,\r\n",
-		"//                                 where the dial can stop on an opto barrier and cause oscillations (and unwanted counts).\r\n",
-		"//                                 0 = off \r\n",
-		"//                                 < 100 msec times will not be very effective.\r\n",
+#endif
+        "// count_minimum_pulse_period_msec: 0 to 4294967295 milliseconds\r\n",
+		"//                                  This parameter sets a pulse rate limiter.\r\n",
+		"//                                  If multiple pulses are detected within the specified time period, they are ignored until the specified idle time has been met.\r\n",
+		"//                                  This can be useful for opto reflective sensors that count slow moving dials. Like water meters or gas meters,\r\n",
+		"//                                  where the dial can stop on an opto barrier and cause oscillations (and unwanted counts).\r\n",
+		"//                                  0 = off \r\n",
+		"//                                  < 100 msec times will not be very effective.\r\n",
 		"//\r\n",
 		NULL
 	};
@@ -595,17 +620,30 @@ void CPiFace::AutoCreate_piface_config(void)
                     sprintf(configline,"piface.%d.%s.%d.count_type=%s\r\n",BoardNr,PortType.c_str(),PinNr,ValueText.c_str());
                     ConfigFile.write(configline,strlen(configline));
 
-                    Value=IOport->Pin[PinNr].Count.GetDivider();
-                    sprintf(configline,"piface.%d.%s.%d.count_divider=%d\r\n",BoardNr,PortType.c_str(),PinNr,Value);
-                    ConfigFile.write(configline,strlen(configline));
+                    if (
+                        IOport->Pin[PinNr].Count.Type != COUNT_TYPE_GENERIC
+                        && IOport->Pin[PinNr].Count.Type != COUNT_TYPE_RFXMETER
+                    ) {
+                        Value=IOport->Pin[PinNr].Count.GetDivider();
+                        sprintf(configline,"piface.%d.%s.%d.count_divider=%d\r\n",BoardNr,PortType.c_str(),PinNr,Value);
+                        ConfigFile.write(configline,strlen(configline));
+                    }
                     
                     Value=IOport->Pin[PinNr].Count.GetUpdateInterval()/1000;
                     sprintf(configline,"piface.%d.%s.%d.count_update_interval_sec=%d\r\n",BoardNr,PortType.c_str(),PinNr,Value);
                     ConfigFile.write(configline,strlen(configline));
+
+                    Value=IOport->Pin[PinNr].Count.GetUpdateIntervalPerc();
+                    if ( Value > 0 ) {
+                        sprintf(configline,"piface.%d.%s.%d.count_update_interval_diff_perc=%d\r\n",BoardNr,PortType.c_str(),PinNr,Value);
+                        ConfigFile.write(configline,strlen(configline));
+                    }
                     
                     Value=IOport->Pin[PinNr].Count.GetRateLimit();
-                    sprintf(configline,"piface.%d.%s.%d.count_minimum_pulse_period_msec=%d\r\n",BoardNr,PortType.c_str(),PinNr,Value);
-                    ConfigFile.write(configline,strlen(configline));
+                    if ( Value > 0 ) {
+                        sprintf(configline,"piface.%d.%s.%d.count_minimum_pulse_period_msec=%d\r\n",BoardNr,PortType.c_str(),PinNr,Value);
+                        ConfigFile.write(configline,strlen(configline));
+                    }
                     
                     sprintf(configline,"\r\n");
                     ConfigFile.write(configline,strlen(configline));
@@ -713,7 +751,7 @@ bool CPiFace::StopHardware()
             m_queue_thread.reset();
         }
     }
-#ifdef __arm__
+#ifdef HAVE_LINUX_SPI
     if (m_fd > 0) {
         close(m_fd);
         m_fd = 0;
@@ -852,7 +890,7 @@ int CPiFace::Init_SPI_Device(int Init)
     int           speed       = 4000000 ;
     
     _log.Log(LOG_STATUS,"PiFace: Starting PiFace_SPI_Start()");
-#ifdef __arm__
+#ifdef HAVE_LINUX_SPI
     // Open port for reading and writing
     if ((m_fd = open("/dev/spidev0.0", O_RDWR)) >= 0)
     {
@@ -885,7 +923,7 @@ int CPiFace::Init_SPI_Device(int Init)
     
     if (result == -1)
     {
-#ifdef __arm__
+#ifdef HAVE_LINUX_SPI
         close(m_fd);
 #endif
         return -1;
@@ -980,7 +1018,7 @@ void CPiFace::GetAndSetInitialDeviceState(int devId)
 
 int CPiFace::Read_Write_SPI_Byte(unsigned char *data, int len)
 {
-#ifdef __arm__
+#ifdef HAVE_LINUX_SPI
     struct spi_ioc_transfer spi ;
     memset (&spi, 0, sizeof(spi));
     
@@ -1077,6 +1115,29 @@ bool CIOCount::ProcessUpdateInterval(unsigned long PassedTime_ms)
             InitialStateSent=true;
             Update=true;
         }
+        
+        boost::posix_time::ptime Now = boost::posix_time::microsec_clock::universal_time();
+        
+        if (
+            UpdateIntervalPerc > 0 &&
+            Cur_Interval.total_milliseconds() > 0 &&
+            Last_Interval.total_milliseconds() > 0 &&
+            //rate limit the callbacks to max 1 per sec to prevent spamming the upper layer when power suddenly drops
+            ( Now - Last_Callback ).total_milliseconds() >= 1000
+        )
+        {
+            if ( Now - Cur_Pulse > Cur_Interval )
+            {
+                Cur_Interval = Now - Cur_Pulse;
+            }
+            
+			double perc = (100. / Last_Interval.total_milliseconds()) * labs((long)(Cur_Interval.total_milliseconds() - Last_Interval.total_milliseconds()));
+            if ( perc > UpdateIntervalPerc )
+            {
+                UpdateDownCount_ms=UpdateInterval_ms;
+                Update=true;
+            }
+        }
     }
     return Update;
 }
@@ -1085,20 +1146,17 @@ int CIOCount::Update(unsigned long Counts)
 {
     int result = -1;
     
-    Last_Call = Cur_Call;
-    Cur_Call = boost::posix_time::microsec_clock::universal_time();
-    boost::posix_time::time_duration Diff = Cur_Call - Last_Call;
+    Last_Pulse = Cur_Pulse;
+    Cur_Pulse = boost::posix_time::microsec_clock::universal_time();
+    Cur_Interval = Cur_Pulse - Last_Pulse;
     
     if (
         Enabled && (
             Minimum_Pulse_Period_ms == 0 ||
-            Minimum_Pulse_Period_ms <= Diff.total_milliseconds()
+            Minimum_Pulse_Period_ms <= Cur_Interval.total_milliseconds()
         )
     )
     {
-        // We only update the counter, if its enabled, and if the time between the last pulse was
-        // faster than rate limit, or ratelimit was not used.
-        Current += Counts;
         Total += Counts;
         result = 1;
     }
@@ -1109,17 +1167,20 @@ int CIOCount::Update(unsigned long Counts)
 
 CIOCount::CIOCount()
 {
-    ResetCurrent();
     ResetTotal();
     UpdateInterval_ms = 10000;
+    UpdateIntervalPerc = 0;
     Enabled = false;
-    Type = COUNT_TYPE_RFXMETER;
+    Type = COUNT_TYPE_GENERIC;
     InitialStateSent = false;
     UpdateDownCount_ms = 0;
     Minimum_Pulse_Period_ms = 0;
     Divider = 1000;
-    Last_Call = boost::posix_time::microsec_clock::universal_time();
-    Cur_Call = boost::posix_time::microsec_clock::universal_time();
+    Last_Pulse = boost::posix_time::microsec_clock::universal_time();
+    Cur_Pulse = boost::posix_time::microsec_clock::universal_time();
+    Last_Callback = boost::posix_time::microsec_clock::universal_time();
+    Last_Interval = boost::posix_time::milliseconds(0);
+    Cur_Interval = boost::posix_time::milliseconds(0);
 };
 
 CIOCount::~CIOCount()
@@ -1263,8 +1324,6 @@ CIOPinState::~CIOPinState()
 void CIOPort::Init(bool Available, int hwdId, int devId /* 0 - 4 */, unsigned char housecode, unsigned char initial_state)
 {
     int PinNr;
-    int hardware_type;
-    int meterid;
     unsigned long value;
     bool found;
 
@@ -1295,14 +1354,13 @@ void CIOPort::Init(bool Available, int hwdId, int devId /* 0 - 4 */, unsigned ch
                 Pin[PinNr].IOPinCounterPacket.RFXMETER.rssi = 12;
                 Pin[PinNr].IOPinCounterPacket.RFXMETER.seqnbr = 0;
 
-                // GetLastKnownValues
-                hardware_type = pTypeRFXMeter;
+                int meterid;
                 if (housecode == 'I')
                     meterid=100+PinNr + (devId*10);
                 else
                     meterid=0+PinNr + (devId*10);
                 
-                result = m_sql.safe_query("SELECT sValue FROM DeviceStatus WHERE (HardwareID=%d AND Type=%d AND DeviceID='%d')", hwdId, hardware_type, meterid);
+                result = m_sql.safe_query("SELECT sValue FROM DeviceStatus WHERE (HardwareID=%d AND Type=%d AND DeviceID='%d')", hwdId, int(pTypeRFXMeter), meterid);
                 if (result.size() == 1)
                 {
                     value = atol(result[0][0].c_str());
@@ -1311,26 +1369,19 @@ void CIOPort::Init(bool Available, int hwdId, int devId /* 0 - 4 */, unsigned ch
                 break;
       
             case COUNT_TYPE_ENERGY:
-                //set generic packet info for ENERGY packet, so we do not have every packet
-                Pin[PinNr].IOPinCounterPacket.ENERGY.packetlength = sizeof(Pin[PinNr].IOPinCounterPacket.ENERGY) -1;
-                Pin[PinNr].IOPinCounterPacket.ENERGY.packettype = pTypeENERGY;
-                Pin[PinNr].IOPinCounterPacket.ENERGY.subtype = sTypeELEC2;
-                Pin[PinNr].IOPinCounterPacket.ENERGY.rssi = 12;
-                Pin[PinNr].IOPinCounterPacket.ENERGY.seqnbr = 0;
-                Pin[PinNr].IOPinCounterPacket.ENERGY.battery_level = 9;
-
-                // GetLastKnownValues
-                hardware_type = pTypeGeneral;
+                int nodeId;
                 if (housecode == 'I')
-                    meterid=300+PinNr + (devId*10);
+                    nodeId=300+devId;
                 else
-                    meterid=200+PinNr + (devId*10);
-                
-                result = m_sql.safe_query("SELECT sValue FROM DeviceStatus WHERE (HardwareID=%d AND Type=%d AND DeviceID='%08X')", hwdId, hardware_type, meterid);
+                    nodeId=200+devId;
+
+                int dID = (nodeId << 8) | PinNr;
+              
+                result = m_sql.safe_query("SELECT sValue FROM DeviceStatus WHERE (HardwareID=%d AND Type=%d AND DeviceID='%08X')", hwdId, int(pTypeGeneral), dID);
                 if (result.size() == 1)
                 {
                     StringSplit(result[0][0], ";", resultparts);
-					double dValue = 0;
+                    double dValue = 0;
                     if (resultparts.size() == 1)
                     {
                         dValue = atol(resultparts[0].c_str()) / ( 1000. / Pin[PinNr].Count.GetDivider() );
@@ -1341,13 +1392,12 @@ void CIOPort::Init(bool Available, int hwdId, int devId /* 0 - 4 */, unsigned ch
                         dValue = atol(resultparts[1].c_str()) / ( 1000. / Pin[PinNr].Count.GetDivider() );
                         found = true;
                     }
-					value = (unsigned long)dValue;
+                    value = (unsigned long)dValue;
                 }
                 break;
         }
     
         if ( found ) {
-            Pin[PinNr].Count.SetCurrent(value);
             Pin[PinNr].Count.SetTotal(value);
         }
     }
@@ -1360,107 +1410,87 @@ void CIOPort::Init(bool Available, int hwdId, int devId /* 0 - 4 */, unsigned ch
 int CIOPort::Update(unsigned char New)
 {
     int mask=0x01;
-    int i;
     int ChangeState=-1;
     bool UpdateCounter=false;
-    int meterid;
     
     CPiFace *myCallback = reinterpret_cast<CPiFace*>(Callback_pntr);
     
     Last=Current;
     Current=New;
     
-    for (i=0;i <= 7;i++)
+    for (int PinNr=0; PinNr<=7 ;PinNr++)
     {
-        ChangeState=Pin[i].Update((New&mask)==mask);
-        if ((ChangeState >=0) || ((!Pin[i].InitialStateSent) && Pin[i].Enabled))
+        ChangeState=Pin[PinNr].Update((New&mask)==mask);
+        if ((ChangeState >=0) || ((!Pin[PinNr].InitialStateSent) && Pin[PinNr].Enabled))
         {
-            Pin[i].InitialStateSent=true;
+            Pin[PinNr].InitialStateSent=true;
             if (ChangeState <0)
             {
                 //we have to sent current state
-                ChangeState=Pin[i].GetInitialState();
+                ChangeState=Pin[PinNr].GetInitialState();
             }
             //We have something to report to the upper layer
             IOPinStatusPacket.LIGHTING1.cmnd = (ChangeState != 0) ? light1_sOn : light1_sOff;
             IOPinStatusPacket.LIGHTING1.seqnbr++;
-            IOPinStatusPacket.LIGHTING1.unitcode = i + (devId*10) ; //report inputs from PiFace X (X0..X9)
+            IOPinStatusPacket.LIGHTING1.unitcode = PinNr + (devId*10) ; //report inputs from PiFace X (X0..X9)
             myCallback->CallBackSendEvent((const unsigned char *)&IOPinStatusPacket, sizeof(IOPinStatusPacket.LIGHTING1));
         }
         
-        UpdateCounter=Pin[i].Count.ProcessUpdateInterval(PIFACE_INPUT_PROCESS_INTERVAL*PIFACE_WORKER_THREAD_SLEEP_INTERVAL_MS);
+        UpdateCounter=Pin[PinNr].Count.ProcessUpdateInterval(PIFACE_INPUT_PROCESS_INTERVAL*PIFACE_WORKER_THREAD_SLEEP_INTERVAL_MS);
         if (UpdateCounter)
         {
-            unsigned long Count = Pin[i].Count.GetTotal();
-            unsigned long LastCount = Pin[i].Count.GetLastTotal();
+            unsigned long Count = Pin[PinNr].Count.GetTotal();
+            unsigned long LastCount = Pin[PinNr].Count.GetLastTotal();
             
-            switch( Pin[i].Count.Type )
+            Pin[PinNr].Count.Last_Callback = boost::posix_time::microsec_clock::universal_time();
+            
+            switch( Pin[PinNr].Count.Type )
             {
                 case COUNT_TYPE_GENERIC:
                 case COUNT_TYPE_RFXMETER:
+                    int meterid;
                     if (IOPinStatusPacket.LIGHTING1.housecode == 'I')
-                        meterid=100+i + (devId*10);
+                        meterid=100+PinNr + (devId*10);
                     else
-                        meterid=0+i + (devId*10);
+                        meterid=0+PinNr + (devId*10);
     
-                    Pin[i].IOPinCounterPacket.RFXMETER.id1=((meterid >>8) & 0xFF);
-                    Pin[i].IOPinCounterPacket.RFXMETER.id2= (meterid & 0xFF);
+                    Pin[PinNr].IOPinCounterPacket.RFXMETER.id1=((meterid >>8) & 0xFF);
+                    Pin[PinNr].IOPinCounterPacket.RFXMETER.id2= (meterid & 0xFF);
                     
                     if (Count != LastCount)
                     {
-                        Pin[i].Count.SetLastTotal(Count);
+                        Pin[PinNr].Count.SetLastTotal(Count);
                         //    _log.Log(LOG_NORM,"Counter %lu\n",Count);
-                        Pin[i].IOPinCounterPacket.RFXMETER.count1 = (unsigned char)((Count >> 24) & 0xFF);
-                        Pin[i].IOPinCounterPacket.RFXMETER.count2 = (unsigned char)((Count >> 16) & 0xFF);
-                        Pin[i].IOPinCounterPacket.RFXMETER.count3 = (unsigned char)((Count >> 8) & 0xFF);
-                        Pin[i].IOPinCounterPacket.RFXMETER.count4 = (unsigned char)((Count)& 0xFF);
-                        Pin[i].IOPinCounterPacket.RFXMETER.seqnbr++;
-                        //    _log.Log(LOG_NORM,"RFXMeter Packet C1 %d, C2 %d C3 %d C4 %d\n",Pin[i].IOPinCounterPacket.RFXMETER.count1,Pin[i].IOPinCounterPacket.RFXMETER.count2,Pin[i].IOPinCounterPacket.RFXMETER.count3,Pin[i].IOPinCounterPacket.RFXMETER.count4);
-                        myCallback->CallBackSendEvent((const unsigned char *)&Pin[i].IOPinCounterPacket, sizeof(Pin[i].IOPinCounterPacket.RFXMETER));
+                        Pin[PinNr].IOPinCounterPacket.RFXMETER.count1 = (unsigned char)((Count >> 24) & 0xFF);
+                        Pin[PinNr].IOPinCounterPacket.RFXMETER.count2 = (unsigned char)((Count >> 16) & 0xFF);
+                        Pin[PinNr].IOPinCounterPacket.RFXMETER.count3 = (unsigned char)((Count >> 8) & 0xFF);
+                        Pin[PinNr].IOPinCounterPacket.RFXMETER.count4 = (unsigned char)((Count)& 0xFF);
+                        Pin[PinNr].IOPinCounterPacket.RFXMETER.seqnbr++;
+                        //    _log.Log(LOG_NORM,"RFXMeter Packet C1 %d, C2 %d C3 %d C4 %d\n",Pin[PinNr].IOPinCounterPacket.RFXMETER.count1,Pin[PinNr].IOPinCounterPacket.RFXMETER.count2,Pin[PinNr].IOPinCounterPacket.RFXMETER.count3,Pin[PinNr].IOPinCounterPacket.RFXMETER.count4);
+                        myCallback->CallBackSendEvent((const unsigned char *)&Pin[PinNr].IOPinCounterPacket, sizeof(Pin[PinNr].IOPinCounterPacket.RFXMETER));
                     }
                     break;
                     
                 case COUNT_TYPE_ENERGY:
+                    int nodeId;
                     if (IOPinStatusPacket.LIGHTING1.housecode == 'I')
-                        meterid=300+i + (devId*10); // this will create new devices if type is changed afterwards
+                        nodeId=300+devId;
                     else
-                        meterid=200+i + (devId*10);
-    
-                    Pin[i].IOPinCounterPacket.ENERGY.id1=((meterid >>8) & 0xFF);
-                    Pin[i].IOPinCounterPacket.ENERGY.id2= (meterid & 0xFF);
+                        nodeId=200+devId;
                     
-                    boost::posix_time::time_duration Diff = Pin[i].Count.Cur_Call - Pin[i].Count.Last_Call;
-                    boost::posix_time::ptime Now = boost::posix_time::microsec_clock::universal_time();
-                    if ( Now - Pin[i].Count.Cur_Call > Diff )
-                    {
-                        Diff = Now - Pin[i].Count.Cur_Call;
-                    }
+                    // Energy devices are updated *every* time because their current power usage (Watt) drops if no pulses
+                    // are registered between the interval.
+                    Pin[PinNr].Count.SetLastTotal(Count);
+                    
                     if (
-                        Diff.total_milliseconds() > 0 &&
-                        Pin[i].Count.GetDivider() > 0
+                        Pin[PinNr].Count.Cur_Interval.total_milliseconds() > 0 &&
+                        Pin[PinNr].Count.GetDivider() > 0
                     )
                     {
-                        double dEnergy = ( ( 1000. / Pin[i].Count.GetDivider() ) * Count  ); // kWh
-                        dEnergy *= 223.666;
-                        double dPower = ( ( 1000. / Pin[i].Count.GetDivider() ) * ( 1000. / Diff.total_milliseconds() ) * 3600 ); // Watt
-                        
-						uint64_t Energy = (uint64_t)dEnergy;
-						uint64_t Power = (uint64_t)dPower;
-
-                        Pin[i].IOPinCounterPacket.ENERGY.instant1 = (unsigned char)((Power >> 24) & 0xFF);
-                        Pin[i].IOPinCounterPacket.ENERGY.instant2 = (unsigned char)((Power >> 16) & 0xFF);
-                        Pin[i].IOPinCounterPacket.ENERGY.instant3 = (unsigned char)((Power >> 8) & 0xFF);
-                        Pin[i].IOPinCounterPacket.ENERGY.instant4 = (unsigned char)((Power)& 0xFF);
-                        
-                        Pin[i].IOPinCounterPacket.ENERGY.total1 = (unsigned char)((Energy >> 40) & 0xFF);
-                        Pin[i].IOPinCounterPacket.ENERGY.total2 = (unsigned char)((Energy >> 32) & 0xFF);
-                        Pin[i].IOPinCounterPacket.ENERGY.total3 = (unsigned char)((Energy >> 24) & 0xFF);
-                        Pin[i].IOPinCounterPacket.ENERGY.total4 = (unsigned char)((Energy >> 16) & 0xFF);
-                        Pin[i].IOPinCounterPacket.ENERGY.total5 = (unsigned char)((Energy >> 8) & 0xFF);
-                        Pin[i].IOPinCounterPacket.ENERGY.total6 = (unsigned char)((Energy)& 0xFF);
-                        
-                        Pin[i].IOPinCounterPacket.ENERGY.seqnbr++;
-                        myCallback->CallBackSendEvent((const unsigned char *)&Pin[i].IOPinCounterPacket, sizeof(Pin[i].IOPinCounterPacket.ENERGY));
+                        Pin[PinNr].Count.Last_Interval = Pin[PinNr].Count.Cur_Interval;
+                        double dEnergy = ( ( 1. / Pin[PinNr].Count.GetDivider() ) * Count  ); // kWh
+                        double dPower = ( ( 1000. / Pin[PinNr].Count.GetDivider() ) * ( 1000. / Pin[PinNr].Count.Cur_Interval.total_milliseconds() ) * 3600 ); // Watt
+                        myCallback->SendKwhMeter(nodeId, PinNr, 255, dPower, dEnergy, "kWh Meter" );
                     }
                     break;
             }
@@ -1474,13 +1504,12 @@ int CIOPort::Update(unsigned char New)
 int CIOPort::UpdateInterrupt(unsigned char IntFlag,unsigned char PinState)
 {
     int mask=0x01;
-    int i;
     int ChangeState=-1; //nothing changed
     int Changed;
     
-    for (i=0;i <= 7;i++)
+    for (int PinNr=0; PinNr<=7 ;PinNr++)
     {
-        Changed=Pin[i].UpdateInterrupt(((IntFlag&mask)==mask),((PinState&mask)==mask));
+        Changed=Pin[PinNr].UpdateInterrupt(((IntFlag&mask)==mask),((PinState&mask)==mask));
         if (Changed != -1)
             ChangeState=Changed;
         mask<<=1;
@@ -1507,9 +1536,9 @@ CIOPort::CIOPort()
     Callback_pntr = NULL;
     PortType = 0;
     devId = 0;
-    for (int i=0; i<8; i++)
+    for (int PinNr=0; PinNr<=7 ;PinNr++)
     {
-        Pin[i].Id=i;
+        Pin[PinNr].Id=PinNr;
     }
     
 };
@@ -1519,5 +1548,26 @@ CIOPort::~CIOPort()
     
 };
 
+//Webserver helpers
+namespace http {
+    namespace server {
+        void CWebServer::ReloadPiFace(WebEmSession & session, const request& req, std::string & redirect_uri)
+        {
+            redirect_uri = "/index.html";
+            if (session.rights != 2)
+			{
+				session.reply_status = reply::forbidden;
+				return; //Only admin user allowed
+			}
+
+            std::string idx = request::findValue(&req, "idx");
+            if (idx == "") {
+                return;
+            }
+            
+            m_mainworker.RestartHardware(idx);
+        }
+    }
+}
 
 
